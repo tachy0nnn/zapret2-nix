@@ -47,6 +47,8 @@ let
     zLib.mkPresetConf {
       inherit preset;
       inherit (cfg) qnum;
+      fwmark = cfg.firewall.desyncMark;
+      luaInit = map (f: "${cfg.package}/share/zapret2/lua/${f}") cfg.luaModules;
     };
 
   availableDir = "/etc/zapret2/available";
@@ -170,6 +172,30 @@ in
         Пресет, который становится активным при первом запуске (и если
         текущий активный исчез из конфигурации). По умолчанию — первый из
         `presets`.
+      '';
+    };
+
+    luaModules = mkOption {
+      type = types.listOf types.str;
+      default = [
+        "zapret-lib.lua"
+        "zapret-antidpi.lua"
+        "zapret-auto.lua"
+      ];
+      example = [
+        "zapret-lib.lua"
+        "zapret-antidpi.lua"
+        "zapret-auto.lua"
+        "zapret-obfs.lua"
+      ];
+      description = ''
+        Lua-файлы из пакета zapret2, загружаемые перед стратегиями
+        (`--lua-init`). Именно они определяют функции воздействий: `fake`,
+        `multisplit`, `multidisorder` и прочие — в самом бинаре их нет.
+        Порядок важен: `zapret-lib` идёт первым, остальные строятся на нём.
+
+        Набор по умолчанию повторяет апстримные init-скрипты. Добавляй сюда,
+        если пресету нужны функции из других модулей (например `zapret-obfs`).
       '';
     };
 

@@ -28,11 +28,20 @@ let
       ];
     }).config.presets;
 
+  # Те же параметры, что подставляет модуль в реальной системе — иначе тест
+  # проверял бы не то, что запускается.
+  luaInit = map (f: "${pkgs.zapret2}/share/zapret2/lua/${f}") [
+    "zapret-lib.lua"
+    "zapret-antidpi.lua"
+    "zapret-auto.lua"
+  ];
+
   confs = lib.mapAttrsToList (name: preset: {
     inherit name;
     file = zLib.mkPresetConf {
-      inherit preset;
+      inherit preset luaInit;
       qnum = 200;
+      fwmark = "0x40000000";
     };
   }) evaluated;
 in
@@ -54,6 +63,19 @@ pkgs.runCommand "zapret2-presets-eval"
         echo "   ОШИБКА: в конфиге нет ни одного --lua-desync (пресет ничего не делает)" >&2; fail=1
       fi
 
+      # Регрессия, уже случившаяся однажды: без --lua-init функции воздействий
+      # (fake, multisplit, …) не определены, и служба падает на старте с
+      # «desync function ... does not exist». Разбор опций при этом проходит,
+      # и локально nfqws2 молчит — поймать можно только структурно.
+      if ! grep -q -- '--lua-init=@' ${c.file}; then
+        echo "   ОШИБКА: в конфиге нет --lua-init — стратегии не будут определены" >&2; fail=1
+      fi
+      # Без --fwmark nfqws2 не пометит свои пакеты, и правило firewall,
+      # отсеивающее их по метке, пропустит трафик по кругу.
+      if ! grep -q -- '--fwmark=' ${c.file}; then
+        echo "   ОШИБКА: в конфиге нет --fwmark — возможна петля в NFQUEUE" >&2; fail=1
+      fi
+
       # Реальный разбор конфига движком. Ненулевой код возврата ожидаем
       # (в песочнице нет прав на setpcap/nfqueue) — важен ТОЛЬКО разбор опций.
       # ВАЖНО: переменную нельзя звать `out` — затрёт $out деривации.
@@ -61,6 +83,14 @@ pkgs.runCommand "zapret2-presets-eval"
       if echo "$parsed" | grep -qi 'unrecognized option\|invalid option\|bad argument'; then
         echo "   ОШИБКА: nfqws2 не принял опции:" >&2
         echo "$parsed" | grep -i 'unrecognized option\|invalid option\|bad argument' >&2
+        fail=1
+      fi
+      # Функции воздействий определены в Lua-модулях. Если забыть --lua-init,
+      # опции разберутся, но на старте будет «desync function ... does not
+      # exist» — этот баг однажды уже проехал сюда и всплыл только в VM.
+      if echo "$parsed" | grep -qi 'does not exist\|lua error\|cannot open'; then
+        echo "   ОШИБКА: стратегия не разрешилась (проверь --lua-init):" >&2
+        echo "$parsed" | grep -i 'does not exist\|lua error\|cannot open' >&2
         fail=1
       fi
       if ! echo "$parsed" | grep -q 'desync profile'; then

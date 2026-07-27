@@ -91,9 +91,23 @@ rec {
 
   # --------------------------------------------------------------------------
   # Полный conf-файл пресета.
+  #
+  # `luaInit` и `fwmark` приходят снаружи, а не зашиты здесь: пути к Lua-файлам
+  # принадлежат пакету, а рендер про пакет знать не должен (DIP). Модуль их и
+  # подставляет.
+  #
+  # ⚠️ Без --lua-init nfqws2 стартует, разбирает опции, а потом падает с
+  # «desync function 'fake' does not exist»: функции воздействий (fake,
+  # multisplit, multidisorder…) определены именно в этих Lua-файлах, в самом
+  # бинаре их нет. Поймано VM-тестом.
   # --------------------------------------------------------------------------
   renderPreset =
-    { preset, qnum }:
+    {
+      preset,
+      qnum,
+      fwmark,
+      luaInit,
+    }:
     let
       ctx = {
         presetName = preset.name;
@@ -110,13 +124,17 @@ rec {
       --qnum=${toString qnum}
       --comment=zapret2-nix:${preset.name}
 
+      # Метка на пакетах, которые порождает сам nfqws2 — по ней правило
+      # firewall отсеивает их и не отправляет в очередь повторно.
+      --fwmark=${fwmark}
+
+      # Библиотека стратегий. Порядок важен: zapret-lib определяет базу,
+      # остальные — функции воздействий поверх неё.
+      ${concatStringsSep "\n" (map (f: "--lua-init=@${f}") luaInit)}
+
       ${renderProfiles ctx preset.profiles}
     '';
 
   # Готовый файл в store.
-  mkPresetConf =
-    { preset, qnum }:
-    pkgs.writeText "zapret2-${preset.name}.conf" (renderPreset {
-      inherit preset qnum;
-    });
+  mkPresetConf = args: pkgs.writeText "zapret2-${args.preset.name}.conf" (renderPreset args);
 }
