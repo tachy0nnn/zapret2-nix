@@ -1,0 +1,122 @@
+# ============================================================================
+# Рендер пресета в conf-файл для `nfqws2 @<file>`.
+#
+# Чистая функция: пресет (данные) → текст конфига. Ничего не знает ни про
+# systemd, ни про firewall (ISP) — поэтому тестируется в отрыве от системы.
+#
+# Формат проверен на nfqws2 v1.0.x:
+#   • `@file` должен быть ЕДИНСТВЕННЫМ аргументом (остальные игнорируются),
+#     поэтому глобальные опции вроде --qnum кладём внутрь файла;
+#   • поддерживаются комментарии `#` и пустые строки;
+#   • профили разделяются `--new`, аргументы можно переносить по строкам.
+# ============================================================================
+{ lib, pkgs }:
+
+let
+  inherit (lib)
+    concatStringsSep
+    optional
+    imap0
+    ;
+
+  # Хостлист — отдельный файл в store (nfqws2 читает его сам, gzip не нужен).
+  mkHostlistFile =
+    name: domains: pkgs.writeText "zapret2-hostlist-${name}" (concatStringsSep "\n" domains + "\n");
+in
+rec {
+  inherit mkHostlistFile;
+
+  # --------------------------------------------------------------------------
+  # Аргументы одного профиля (без ведущего --new — его добавляет renderProfiles).
+  #
+  # Порядок аргументов повторяет апстримный config.default: фильтры → хостлист
+  # → payload → воздействия. Так сгенерированный конфиг легко сверять с
+  # примерами из документации zapret2.
+  # --------------------------------------------------------------------------
+  renderProfile =
+    {
+      presetName,
+      presetHostlist,
+      presetExclude,
+    }:
+    profile:
+    let
+      f = profile.filter;
+
+      # Какой хостлист у профиля: свой / унаследованный / отключён.
+      effectiveHostlist =
+        if profile.hostlist == null then
+          presetHostlist
+        else if profile.hostlist == false then
+          [ ]
+        else if profile.hostlist == true then
+          presetHostlist
+        else
+          profile.hostlist;
+
+      hostlistArgs =
+        optional (
+          effectiveHostlist != [ ]
+        ) "--hostlist=${mkHostlistFile "${presetName}-in" effectiveHostlist}"
+        ++ optional (
+          presetExclude != [ ]
+        ) "--hostlist-exclude=${mkHostlistFile "${presetName}-ex" presetExclude}";
+    in
+    concatStringsSep " " (
+      optional (f.l3 != null) "--filter-l3=${f.l3}"
+      ++ optional (f.tcp != null) "--filter-tcp=${f.tcp}"
+      ++ optional (f.udp != null) "--filter-udp=${f.udp}"
+      ++ optional (f.l7 != [ ]) "--filter-l7=${concatStringsSep "," f.l7}"
+      ++ hostlistArgs
+      ++ optional (profile.payload != [ ]) "--payload=${concatStringsSep "," profile.payload}"
+      ++ map (d: "--lua-desync=${d}") profile.desync
+      ++ profile.extraArgs
+    );
+
+  # --------------------------------------------------------------------------
+  # Профили целиком. Первый идёт без `--new` (он и есть первый профиль),
+  # каждый следующий начинается с `--new` либо `--new=<имя>`.
+  # --------------------------------------------------------------------------
+  renderProfiles =
+    ctx: profiles:
+    concatStringsSep "\n" (
+      imap0 (
+        i: p:
+        let
+          body = renderProfile ctx p;
+        in
+        if i == 0 then body else "${if p.name != null then "--new=${p.name}" else "--new"} ${body}"
+      ) profiles
+    );
+
+  # --------------------------------------------------------------------------
+  # Полный conf-файл пресета.
+  # --------------------------------------------------------------------------
+  renderPreset =
+    { preset, qnum }:
+    let
+      ctx = {
+        presetName = preset.name;
+        presetHostlist = preset.hostlist;
+        presetExclude = preset.hostlistExclude;
+      };
+    in
+    ''
+      # Сгенерировано zapret2-nix. Правки будут потеряны при пересборке.
+      # Пресет: ${preset.name} — ${preset.description}
+      ${lib.optionalString (
+        preset.meta.lastVerified != null
+      ) "# Последняя проверка: ${preset.meta.lastVerified}"}
+      --qnum=${toString qnum}
+      --comment=zapret2-nix:${preset.name}
+
+      ${renderProfiles ctx preset.profiles}
+    '';
+
+  # Готовый файл в store.
+  mkPresetConf =
+    { preset, qnum }:
+    pkgs.writeText "zapret2-${preset.name}.conf" (renderPreset {
+      inherit preset qnum;
+    });
+}
