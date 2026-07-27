@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Стратегии протухают, а апстрим двигается — ловим поломки до того,
+  # как о них сообщит пользователь.
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Проверка форматирования
+        run: nix fmt -- --ci
+
+      # Быстрая проверка: контракт пресетов + разбор конфигов настоящим nfqws2.
+      - name: Пресеты
+        run: nix build .#checks.x86_64-linux.presets-eval -L
+
+      # Полный прогон в виртуалке: служба, правила firewall, переключение.
+      # Именно здесь проверяется синтаксис nftables — локально `nft -c` не
+      # работает без netlink-доступа.
+      - name: Виртуалка (nftables)
+        run: nix build .#checks.x86_64-linux.nftables -L
+
+      - name: Виртуалка (iptables)
+        run: nix build .#checks.x86_64-linux.iptables -L
