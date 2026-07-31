@@ -10,6 +10,26 @@
   backend,
 }:
 
+let
+  useNft = backend == "nftables";
+
+  # Различия бэкендов — ОДНОСТРОЧНЫМИ значениями, а не блоками кода.
+  # Многострочная интерполяция внутри testScript ломает отступы Python:
+  # Nix вставляет содержимое как есть, и вложенный блок оказывается на нулевой
+  # колонке («Expected an indented block after `with` statement»).
+  fw = {
+    unit = if useNft then "nftables.service" else "firewall.service";
+    # команда, убирающая наши правила
+    drop = if useNft then "nft delete table inet zapret2" else "iptables -t mangle -F POSTROUTING";
+    # команда, выводящая текущие правила
+    list = if useNft then "nft list table inet zapret2" else "iptables -t mangle -S POSTROUTING";
+    # подстрока, по числу которой считаем правила. Для nft это ровно тот текст,
+    # который печатает `nft list` для нашего правила — «queue flags bypass to N»,
+    # а не «queue num N»: последнее относится к другому синтаксису и не совпадёт.
+    marker = if useNft then "queue flags bypass to" else "NFQUEUE";
+  };
+in
+
 pkgs.testers.runNixOSTest {
   name = "zapret2-${backend}";
 
@@ -107,36 +127,19 @@ pkgs.testers.runNixOSTest {
         # «Failed to reload firewall.service».
         # Здесь это состояние воспроизводится явно: убираем правила и грузим
         # конфиг заново. Reload обязан пройти, а правила — вернуться.
-        ${
-          if backend == "nftables" then
-            ''
-              machine.succeed("nft delete table inet zapret2")
-              machine.succeed("systemctl reload-or-restart nftables.service")
-              machine.succeed("nft list table inet zapret2")
-            ''
-          else
-            ''
-              def nfqueue_rules():
-                  return machine.succeed("iptables -t mangle -S POSTROUTING").count("NFQUEUE")
+        expected = machine.succeed("${fw.list}").count("${fw.marker}")
+        assert expected > 0, "правил нет ещё до начала проверки — тест бессмыслен"
 
-              expected = nfqueue_rules()
-              assert expected > 0, "правил NFQUEUE нет ещё до начала проверки"
+        # 1. Правил нет — reload обязан пройти и восстановить их.
+        machine.succeed("${fw.drop}")
+        machine.succeed("systemctl reload-or-restart ${fw.unit}")
+        after = machine.succeed("${fw.list}").count("${fw.marker}")
+        assert after == expected, f"после reload без правил их {after}, ожидалось {expected}"
 
-              # 1. Правил нет — reload обязан пройти и восстановить их.
-              machine.succeed("iptables -t mangle -F POSTROUTING")
-              machine.succeed("systemctl reload firewall.service")
-              assert nfqueue_rules() == expected, (
-                  f"после reload без правил их {nfqueue_rules()}, ожидалось {expected}"
-              )
-
-              # 2. Правила есть — удаление реальное, задвоения быть не должно.
-              machine.succeed("systemctl reload firewall.service")
-              assert nfqueue_rules() == expected, (
-                  f"повторный reload задвоил или потерял правила: "
-                  f"{nfqueue_rules()} вместо {expected}"
-              )
-            ''
-        }
+        # 2. Правила есть — удаление реальное, задвоения быть не должно.
+        machine.succeed("systemctl reload-or-restart ${fw.unit}")
+        again = machine.succeed("${fw.list}").count("${fw.marker}")
+        assert again == expected, f"повторный reload дал {again} правил вместо {expected}"
 
     with subtest("правила снимаются вместе с firewall — сеть не остаётся дырявой"):
         ${
