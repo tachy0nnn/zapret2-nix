@@ -107,20 +107,41 @@ in
             lib.optionalString (connLimit > 0)
               "-m connbytes --connbytes-dir=original --connbytes-mode=packets --connbytes 1:${toString connLimit} ";
 
-          rule =
-            op: proto: portList:
+          # Тело правила одно на добавление и удаление — иначе рассинхрон:
+          # `-D` удаляет правило только при ПОБУКВЕННОМ совпадении с `-I`.
+          body =
+            proto: portList:
+            "POSTROUTING -p ${proto} -m multiport --dports ${ports.toIptables portList} ${limit}-m mark ! --mark ${mark}/${mark} -j NFQUEUE --queue-num ${qnum} --queue-bypass";
+
+          add =
+            proto: portList:
             lib.optionalString (portList != [ ]) ''
-              ip46tables -t mangle ${op} POSTROUTING -p ${proto} -m multiport --dports ${ports.toIptables portList} ${limit}-m mark ! --mark ${mark}/${mark} -j NFQUEUE --queue-num ${qnum} --queue-bypass
+              ip46tables -t mangle -I ${body proto portList}
+            '';
+
+          # `|| true` тут ОБЯЗАТЕЛЕН, и это не небрежность.
+          # extraStopCommands выполняется не только при остановке, но и при
+          # КАЖДОЙ перезагрузке firewall — в том числе самой первой, на системе,
+          # где наших правил ещё нет. iptables на `-D` несуществующего правила
+          # отвечает «Bad rule (does a matching rule exist in that chain?)» и
+          # возвращает 1, а скрипт firewall работает под `set -e`. Без `|| true`
+          # падает весь reload, а вместе с ним и активация всей конфигурации:
+          # nixos-rebuild выходит с «Failed to reload firewall.service».
+          # Ровно это и случилось при первом включении модуля 2026-07-31.
+          del =
+            proto: portList:
+            lib.optionalString (portList != [ ]) ''
+              ip46tables -t mangle -D ${body proto portList} || true
             '';
         in
         {
           networking.firewall.extraCommands = ''
-            ${rule "-I" "tcp" tcpPorts}
-            ${rule "-I" "udp" udpPorts}
+            ${add "tcp" tcpPorts}
+            ${add "udp" udpPorts}
           '';
           networking.firewall.extraStopCommands = ''
-            ${rule "-D" "tcp" tcpPorts}
-            ${rule "-D" "udp" udpPorts}
+            ${del "tcp" tcpPorts}
+            ${del "udp" udpPorts}
           '';
         }
       ))

@@ -98,6 +98,46 @@ pkgs.testers.runNixOSTest {
         active = machine.succeed("readlink -f /var/lib/zapret2/active.conf")
         assert "general" in active, f"не откатились на defaultPreset: {active}"
 
+    with subtest("reload firewall переживает ОТСУТСТВИЕ наших правил"):
+        # Регрессия 2026-07-31. Раньше проверялся только путь stop → start, где
+        # правила на момент удаления ЕСТЬ. А в жизни самый частый путь другой:
+        # модуль включают на работающей системе, nixos-rebuild перезагружает
+        # firewall, extraStopCommands пытается снять правила, которых ещё нет,
+        # iptables возвращает 1 — и активация ВСЕЙ конфигурации падает с
+        # «Failed to reload firewall.service».
+        # Здесь это состояние воспроизводится явно: убираем правила и грузим
+        # конфиг заново. Reload обязан пройти, а правила — вернуться.
+        ${
+          if backend == "nftables" then
+            ''
+              machine.succeed("nft delete table inet zapret2")
+              machine.succeed("systemctl reload-or-restart nftables.service")
+              machine.succeed("nft list table inet zapret2")
+            ''
+          else
+            ''
+              def nfqueue_rules():
+                  return machine.succeed("iptables -t mangle -S POSTROUTING").count("NFQUEUE")
+
+              expected = nfqueue_rules()
+              assert expected > 0, "правил NFQUEUE нет ещё до начала проверки"
+
+              # 1. Правил нет — reload обязан пройти и восстановить их.
+              machine.succeed("iptables -t mangle -F POSTROUTING")
+              machine.succeed("systemctl reload firewall.service")
+              assert nfqueue_rules() == expected, (
+                  f"после reload без правил их {nfqueue_rules()}, ожидалось {expected}"
+              )
+
+              # 2. Правила есть — удаление реальное, задвоения быть не должно.
+              machine.succeed("systemctl reload firewall.service")
+              assert nfqueue_rules() == expected, (
+                  f"повторный reload задвоил или потерял правила: "
+                  f"{nfqueue_rules()} вместо {expected}"
+              )
+            ''
+        }
+
     with subtest("правила снимаются вместе с firewall — сеть не остаётся дырявой"):
         ${
           if backend == "nftables" then
