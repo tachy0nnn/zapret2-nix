@@ -71,9 +71,15 @@ let
       AVAILABLE="${availableDir}"
       ACTIVE="${activeLink}"
 
+      # readlink БЕЗ -f, и это важно. Симлинк указывает на
+      # /etc/zapret2/available/<имя>.conf, который сам ведёт в nix store.
+      # `readlink -f` разрешает цепочку до конца и возвращает
+      # /nix/store/<хеш>-zapret2-<имя>.conf — пользователю показывался хеш
+      # вместо имени пресета, а в `list` из-за этого никогда не появлялась
+      # звёздочка у активного. Один уровень — ровно то, что мы сами записали.
       current() {
         [ -L "$ACTIVE" ] || { echo "(не задан)"; return; }
-        basename "$(readlink -f "$ACTIVE")" .conf | sed 's/^zapret2-//'
+        basename "$(readlink "$ACTIVE")" .conf
       }
 
       case "''${1-status}" in
@@ -344,7 +350,12 @@ in
         RestartSec = "5s";
 
         StateDirectory = "zapret2";
-        StateDirectoryMode = "0700";
+        # 0755, а не 0700: внутри лежит единственный симлинк на активный пресет,
+        # и ничего секретного в нём нет — сами пресеты и так публичны в
+        # /etc/zapret2/available. При 0700 обычный пользователь не мог войти в
+        # каталог, и `zapret2ctl status` без sudo врал «(не задан)», хотя
+        # пресет был выставлен. Запись остаётся только у root.
+        StateDirectoryMode = "0755";
 
         # `@file` должен быть единственным аргументом nfqws2 — все опции,
         # включая --qnum, лежат внутри самого файла.

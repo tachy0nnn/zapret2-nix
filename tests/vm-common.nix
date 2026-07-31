@@ -93,8 +93,23 @@ pkgs.testers.runNixOSTest {
     with subtest("zapret2ctl показывает состояние"):
         out = machine.succeed("zapret2ctl status")
         assert "general" in out, f"status не показывает активный пресет:\n{out}"
+        # Регрессия: current() использовал `readlink -f` и разрешал ссылку до
+        # конца, показывая /nix/store/<хеш>-zapret2-general вместо «general».
+        assert "/nix/store" not in out and "-zapret2-" not in out, (
+            f"status показывает путь в store вместо имени пресета:\n{out}"
+        )
         listed = machine.succeed("zapret2ctl list")
         assert "youtube" in listed and "general" in listed, f"list неполон:\n{listed}"
+        # По той же причине активный пресет не помечался звёздочкой.
+        assert "* general" in listed, f"активный пресет не отмечен в list:\n{listed}"
+
+    with subtest("status читается БЕЗ root"):
+        # Регрессия: StateDirectoryMode=0700 не давал обычному пользователю
+        # войти в /var/lib/zapret2, проверка `[ -L ]` падала, и status врал
+        # «(не задан)», хотя пресет выставлен.
+        out = machine.succeed("runuser -u nobody -- zapret2ctl status")
+        assert "general" in out, f"без root status не видит активный пресет:\n{out}"
+        assert "не задан" not in out, f"без root status врёт «(не задан)»:\n{out}"
 
     with subtest("переключение пресета БЕЗ пересборки системы"):
         machine.succeed("zapret2ctl switch youtube")
