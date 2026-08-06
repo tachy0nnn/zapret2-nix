@@ -34,6 +34,11 @@ let
 
   useNft =
     if fw.backend == "auto" then config.networking.nftables.enable else fw.backend == "nftables";
+
+  # Сужение до исходящих интерфейсов. Пустой список трактуем как «все» —
+  # иначе получилось бы правило, не подходящее ни к одному пакету, то есть
+  # молча выключенный обход.
+  ifaces = if fw.interfaces == null || fw.interfaces == [ ] then null else fw.interfaces;
 in
 {
   config = lib.mkIf (cfg.enable && fw.enable) (
@@ -80,11 +85,14 @@ in
               # их нельзя возвращать в очередь, иначе получим петлю.
               skipOwn = "meta mark and ${mark} == ${mark} return";
               limit = lib.optionalString (connLimit > 0) "ct original packets 1-${toString connLimit} ";
+              oif =
+                lib.optionalString (ifaces != null)
+                  "oifname { ${lib.concatMapStringsSep ", " (i: ''"${i}"'') ifaces} } ";
               rule =
                 proto: portList:
                 lib.optionalString (
                   portList != [ ]
-                ) "${proto} dport ${ports.toNft portList} ${limit}queue flags bypass to ${qnum}";
+                ) "${oif}${proto} dport ${ports.toNft portList} ${limit}queue flags bypass to ${qnum}";
             in
             ''
               chain zapret2_postrouting {
@@ -107,17 +115,24 @@ in
             lib.optionalString (connLimit > 0)
               "-m connbytes --connbytes-dir=original --connbytes-mode=packets --connbytes 1:${toString connLimit} ";
 
+          # iptables принимает `-o` только по одному интерфейсу на правило,
+          # поэтому здесь список разворачивается в несколько правил. Пустая
+          # строка — «без привязки к интерфейсу», ровно одно правило.
+          oifs = if ifaces == null then [ "" ] else map (i: "-o ${i} ") ifaces;
+
           # Тело правила одно на добавление и удаление — иначе рассинхрон:
           # `-D` удаляет правило только при ПОБУКВЕННОМ совпадении с `-I`.
           body =
-            proto: portList:
-            "POSTROUTING -p ${proto} -m multiport --dports ${ports.toIptables portList} ${limit}-m mark ! --mark ${mark}/${mark} -j NFQUEUE --queue-num ${qnum} --queue-bypass";
+            proto: portList: oif:
+            "POSTROUTING ${oif}-p ${proto} -m multiport --dports ${ports.toIptables portList} ${limit}-m mark ! --mark ${mark}/${mark} -j NFQUEUE --queue-num ${qnum} --queue-bypass";
 
           add =
             proto: portList:
-            lib.optionalString (portList != [ ]) ''
-              ip46tables -t mangle -I ${body proto portList}
-            '';
+            lib.optionalString (portList != [ ]) (
+              lib.concatMapStrings (oif: ''
+                ip46tables -t mangle -I ${body proto portList oif}
+              '') oifs
+            );
 
           # `|| true` тут ОБЯЗАТЕЛЕН, и это не небрежность.
           # extraStopCommands выполняется не только при остановке, но и при
@@ -130,9 +145,11 @@ in
           # Ровно это и случилось при первом включении модуля 2026-07-31.
           del =
             proto: portList:
-            lib.optionalString (portList != [ ]) ''
-              ip46tables -t mangle -D ${body proto portList} || true
-            '';
+            lib.optionalString (portList != [ ]) (
+              lib.concatMapStrings (oif: ''
+                ip46tables -t mangle -D ${body proto portList oif} || true
+              '') oifs
+            );
         in
         {
           networking.firewall.extraCommands = ''

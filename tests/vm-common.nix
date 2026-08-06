@@ -49,6 +49,9 @@ pkgs.testers.runNixOSTest {
         ];
         defaultPreset = "general";
         firewall.backend = backend;
+        # Сужение до одного интерфейса проверяется вместе с остальным: без него
+        # правило ловит и трафик в VPN-туннель, и трафик контейнеров.
+        firewall.interfaces = [ "eth1" ];
       };
     };
 
@@ -89,6 +92,37 @@ pkgs.testers.runNixOSTest {
               assert "0x40000000" in rules, f"нет защиты от петли по метке:\n{rules}"
             ''
         }
+
+    with subtest("правило сужено до заданного интерфейса"):
+        # Иначе NFQUEUE ловит ВСЁ, включая пакеты в VPN-туннель (там обход
+        # бесполезен, а сессии рвутся) и трафик docker-бриджей.
+        rules = machine.succeed("${fw.list}")
+        assert "eth1" in rules, f"правило не привязано к интерфейсу:\n{rules}"
+
+    with subtest("стратегии выгружены в формате blockcheck2"):
+        machine.succeed("test -s /etc/zapret2/blockcheck/tls.txt")
+        tls = machine.succeed("cat /etc/zapret2/blockcheck/tls.txt")
+        assert "--lua-desync=" in tls, f"в списке нет ни одной стратегии:\n{tls}"
+        assert "--payload=tls_client_hello" in tls, f"в списке нет payload:\n{tls}"
+        # Фильтры и хостлист в список попадать не должны: blockcheck2 сужает
+        # тест сам, а чужой хостлист отменил бы воздействие и дал бы ложное
+        # «стратегия не работает».
+        assert "--filter-" not in tls, f"в список утёк фильтр:\n{tls}"
+        assert "--hostlist" not in tls, f"в список утёк хостлист:\n{tls}"
+
+    with subtest("blockcheck отказывается работать через туннель"):
+        # Самая дорогая из возможных ошибок подбора: через VPN заблокированное
+        # открывается само, и blockcheck2 объявляет рабочей любую стратегию.
+        machine.succeed("ip link add wg-test type dummy")
+        machine.succeed("ip link set wg-test up")
+        machine.succeed("ip addr add 10.77.0.1/24 dev wg-test")
+        machine.succeed("ip route add 0.0.0.0/1 dev wg-test")
+        out = machine.fail("zapret2-blockcheck --presets example.com 2>&1")
+        assert "wg-test" in out, f"туннель не назван в отказе:\n{out}"
+        # Служба не должна пострадать от отвергнутого запуска.
+        machine.succeed("systemctl is-active zapret2.service")
+        machine.succeed("ip route del 0.0.0.0/1 dev wg-test")
+        machine.succeed("ip link del wg-test")
 
     with subtest("zapret2ctl показывает состояние"):
         out = machine.succeed("zapret2ctl status")

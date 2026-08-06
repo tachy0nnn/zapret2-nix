@@ -83,21 +83,45 @@ themselves**, so the rules can never drift out of sync with the strategies.
 | `youtube` | YouTube / googlevideo — TLS ClientHello + QUIC |
 | `discord` | Discord — TLS for API/CDN, STUN + IP discovery for voice |
 | `general` | Generic HTTP + TLS + QUIC, no domain restriction |
+| `general-ts` | Same coverage, **different strategy family**: single `fake` with timestamp fooling, no split |
 
-No preset works everywhere: DPI differs between ISPs and changes over time. If
-none of them work, find your own strategy with `blockcheck2` (see below) and
-either add it locally via `extraPresets` or
-[contribute it](CONTRIBUTING.md).
+No preset works everywhere: DPI differs between ISPs and changes over time.
+
+Mind the difference between a *preset* and a *strategy*. `youtube`, `discord` and
+`general` differ only in **domain coverage** — the desync chain is the same in
+all three: `fake` with `tcp_md5` plus `multisplit`/`multidisorder`. If your ISP's
+DPI defeats that family, cycling through those three proves nothing: they break
+identically. What you need is a different family, which is what `general-ts` is
+(the zapret 1.x classic: `fake` with timestamp fooling and no request splitting).
+If that doesn't work either, find your own with `zapret2-blockcheck` and either
+add it locally via `extraPresets` or [contribute it](CONTRIBUTING.md).
 
 ### Finding a working strategy
 
 ```console
-$ sudo blockcheck2
+$ sudo zapret2-blockcheck --presets     # do my declared strategies work? (seconds)
+$ sudo zapret2-blockcheck               # quick sweep of standard ones (minutes)
+$ sudo zapret2-blockcheck --full        # full upstream sweep (hours)
 ```
 
-`blockcheck2` ships with the `zapret2` package and tests strategies against
-real blocked sites on **your** connection. Translate what it finds into a
-preset:
+`zapret2-blockcheck` wraps upstream `blockcheck2` and fixes three things about
+it:
+
+- **Time.** Upstream's standard scan spends ~85% of its probes on a TTL sweep,
+  and every probe means starting `nfqws2`, installing rules and waiting for a
+  curl timeout — hence hours. The quick mode drops the TTL sweep; bring it back
+  with `--full` or `MAX_TTL=12`.
+- **Your own strategies.** `--presets` tests **only** the chains from your
+  declared presets. They are emitted to `/etc/zapret2/blockcheck/*.txt` from the
+  same data as the running config, so the two cannot drift apart. This answers
+  "are my presets wrong, or is the problem elsewhere?".
+- **False success.** `blockcheck2` starts its own `nfqws2` and its own rules, so
+  a running service means traffic is processed twice. And over a VPN, blocked
+  sites open by themselves — every strategy is reported working, including an
+  empty one. The service is stopped for the duration, and a tunnel aborts the
+  run.
+
+Translate what it finds into a preset:
 
 ```nix
 services.zapret2.extraPresets.my-isp = {
@@ -127,10 +151,27 @@ never need to fork this repository.
 | `qnum` | `200` | NFQUEUE number |
 | `firewall.enable` | `true` | Configure firewall rules |
 | `firewall.backend` | `"auto"` | `auto` / `nftables` / `iptables` |
+| `firewall.interfaces` | `null` (all) | Outbound interfaces whose traffic is queued |
 | `firewall.ports.{tcp,udp}` | `null` (derive from presets) | Override port detection |
 | `firewall.connbytesLimit` | `6` | First N packets per connection; `0` = all |
 
 Full descriptions are in the option docs (`modules/zapret2.nix`).
+
+### With a VPN or Docker on the machine, set `firewall.interfaces`
+
+```nix
+services.zapret2.firewall.interfaces = [ "enp5s0" ]; # WAN only
+```
+
+The rule hooks postrouting, and without this option "all interfaces" means
+literally all of them. A full tunnel (`tun0`, `wg0`, `amn0`…) takes over the
+default route, and packets headed into it pass postrouting **before**
+encapsulation — so `nfqws2` desyncs traffic *inside* the tunnel. Your ISP's DPI
+can't see it there anyway, but the server on the far end does receive the forged
+packets, so sessions break and any "is the bypass working?" test becomes
+meaningless. Container traffic on 443 is queued for the same reason. Upstream
+zapret 1.x narrows its rules to auto-detected WAN interfaces; here it is an
+explicit list.
 
 ## Legal notice
 

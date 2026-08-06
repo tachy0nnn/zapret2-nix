@@ -22,9 +22,56 @@ let
   # Хостлист — отдельный файл в store (nfqws2 читает его сам, gzip не нужен).
   mkHostlistFile =
     name: domains: pkgs.writeText "zapret2-hostlist-${name}" (concatStringsSep "\n" domains + "\n");
+
+  # --------------------------------------------------------------------------
+  # Текст, пригодный для строки-комментария conf-файла.
+  #
+  # nfqws2 разбивает файл на токены ПО ПРАВИЛАМ ШЕЛЛА и только потом отбрасывает
+  # то, что начинается с `#`. Поэтому спецсимвол внутри комментария ломает не
+  # комментарий, а ВЕСЬ файл: nfqws2 отвечает «failed to split command line
+  # options from file» и не запускается вовсе.
+  #
+  # Ломающий набор снят с nfqws2 v1.0.3 перебором: ( ) { } ' " ` & | ; < > \
+  # Безопасны, в частности: $ * ? [ ] ! ~ = : , + - / % @ ^ и любая кириллица.
+  #
+  # Актуально это не для наших пресетов, а для чужих: `description` — свободный
+  # текст, и «Discord (голос)» в extraPresets положил бы службу целиком, причём
+  # с сообщением, по которому причину не угадать.
+  safeComment =
+    lib.replaceStrings
+      [
+        "("
+        ")"
+        "{"
+        "}"
+        "'"
+        "\""
+        "`"
+        "&"
+        "|"
+        ";"
+        "<"
+        ">"
+        "\\"
+      ]
+      [
+        "["
+        "]"
+        "["
+        "]"
+        ""
+        ""
+        ""
+        "+"
+        "/"
+        ","
+        ""
+        ""
+        "/"
+      ];
 in
 rec {
-  inherit mkHostlistFile;
+  inherit mkHostlistFile safeComment;
 
   # --------------------------------------------------------------------------
   # Аргументы одного профиля (без ведущего --new — его добавляет renderProfiles).
@@ -117,10 +164,10 @@ rec {
     in
     ''
       # Сгенерировано zapret2-nix. Правки будут потеряны при пересборке.
-      # Пресет: ${preset.name} — ${preset.description}
+      # Пресет: ${safeComment preset.name} — ${safeComment preset.description}
       ${lib.optionalString (
         preset.meta.lastVerified != null
-      ) "# Последняя проверка: ${preset.meta.lastVerified}"}
+      ) "# Последняя проверка: ${safeComment preset.meta.lastVerified}"}
       --qnum=${toString qnum}
       --comment=zapret2-nix:${preset.name}
 
@@ -137,4 +184,84 @@ rec {
 
   # Готовый файл в store.
   mkPresetConf = args: pkgs.writeText "zapret2-${args.preset.name}.conf" (renderPreset args);
+
+  # --------------------------------------------------------------------------
+  # Стратегия профиля в формате списка blockcheck2 (blockcheck2.d/custom).
+  #
+  # Переносятся ТОЛЬКО payload и цепочка воздействий. Фильтры и хостлист
+  # намеренно отбрасываются: blockcheck2 сам сужает тест до IP проверяемого
+  # домена своими правилами, а наш `--filter-tcp`/`--hostlist` там либо
+  # избыточен, либо (хостлист с чужим доменом) отменил бы воздействие целиком
+  # и дал бы ложное «стратегия не работает».
+  # --------------------------------------------------------------------------
+  renderCandidate =
+    profile:
+    concatStringsSep " " (
+      optional (profile.payload != [ ]) "--payload=${concatStringsSep "," profile.payload}"
+      ++ map (d: "--lua-desync=${d}") profile.desync
+      ++ profile.extraArgs
+    );
+
+  # К какому тесту blockcheck2 относится профиль. blockcheck2 держит отдельные
+  # списки стратегий на http / tls / quic, потому что проверяет их разными
+  # запросами curl. Определяем по payload, а если он не задан — по L7-фильтру.
+  #
+  # `null` — профиль не отображается ни на один тест blockcheck2 (например
+  # голос Discord: STUN не проверить обычным curl).
+  candidateKind =
+    profile:
+    let
+      has = x: lib.elem x profile.payload || lib.elem x profile.filter.l7;
+    in
+    if has "quic_initial" || has "quic" then
+      "quic"
+    else if has "tls_client_hello" || has "tls" then
+      "tls"
+    else if has "http_req" || has "http" then
+      "http"
+    else
+      null;
+
+  # --------------------------------------------------------------------------
+  # Список стратегий одного вида по набору пресетов — файл для blockcheck2.
+  #
+  # Одинаковые цепочки объединяются: youtube и general делят одну TLS-стратегию,
+  # и гонять её дважды — только время. В комментарии перед строкой видно, из
+  # каких пресетов она пришла, поэтому по выводу blockcheck2 понятно, какой
+  # именно пресет сработал.
+  # --------------------------------------------------------------------------
+  candidateLines =
+    kind: presets:
+    let
+      pairs = lib.concatMap (
+        preset:
+        map (profile: {
+          line = renderCandidate profile;
+          inherit (preset) name;
+        }) (lib.filter (profile: candidateKind profile == kind) preset.profiles)
+      ) presets;
+    in
+    lib.mapAttrsToList (line: xs: {
+      inherit line;
+      presets = lib.unique (map (x: x.name) xs);
+    }) (lib.groupBy (x: x.line) pairs);
+
+  mkCandidateFile =
+    kind: presets:
+    let
+      entries = candidateLines kind presets;
+    in
+    pkgs.writeText "zapret2-blockcheck-${kind}.txt" (
+      concatStringsSep "\n" (
+        [
+          "# Сгенерировано zapret2-nix: стратегии вида ${kind} из объявленных пресетов."
+          "# Проверяются командой: zapret2-blockcheck --presets"
+        ]
+        ++ lib.concatMap (e: [
+          "# пресет(ы): ${concatStringsSep ", " e.presets}"
+          e.line
+        ]) entries
+      )
+      + "\n"
+    );
 }

@@ -18,6 +18,11 @@ in
     renderProfiles
     mkPresetConf
     mkHostlistFile
+    safeComment
+    renderCandidate
+    candidateKind
+    candidateLines
+    mkCandidateFile
     ;
 
   # --------------------------------------------------------------------------

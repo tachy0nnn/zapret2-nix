@@ -36,14 +36,63 @@ let
     "zapret-auto.lua"
   ];
 
-  confs = lib.mapAttrsToList (name: preset: {
-    inherit name;
-    file = zLib.mkPresetConf {
+  mkConf =
+    preset:
+    zLib.mkPresetConf {
       inherit preset luaInit;
       qnum = 200;
       fwmark = "0x40000000";
     };
-  }) evaluated;
+
+  # ---------------------------------------------------------------------------
+  # Пресет с враждебным описанием. Регрессия, найденная 2026-08-05.
+  #
+  # nfqws2 токенизирует conf-файл по правилам шелла ДО того, как отбросит
+  # строки-комментарии. Из-за этого скобка или кавычка в `description` ломала не
+  # комментарий, а весь файл: «failed to split command line options from file»,
+  # служба не поднималась вообще. Проявлялось только у чужих пресетов —
+  # `description` там свободный текст, и «Discord (голос)» уже достаточно.
+  #
+  # Набор символов ниже — ровно тот, что валит парсер. Тест обязан проходить:
+  # рендер их обезвреживает.
+  hostile = {
+    name = "hostile-description";
+    description = "скобки [нет: (вот)] кавычки ' и \" бэктик ` амперсанд & труба | точка с запятой ; угол < > фигурные { } слеш \\";
+    hostlist = [ ];
+    hostlistExclude = [ ];
+    meta = {
+      testedOn = [ ];
+      lastVerified = null;
+      reference = null;
+    };
+    profiles = [
+      {
+        name = null;
+        filter = {
+          tcp = "443";
+          udp = null;
+          l7 = [ "tls" ];
+          l3 = null;
+        };
+        payload = [ "tls_client_hello" ];
+        desync = [ "fake:blob=fake_default_tls:tcp_ts=-1000" ];
+        hostlist = null;
+        extraArgs = [ ];
+      }
+    ];
+  };
+
+  confs =
+    lib.mapAttrsToList (name: preset: {
+      inherit name;
+      file = mkConf preset;
+    }) evaluated
+    ++ [
+      {
+        name = hostile.name;
+        file = mkConf hostile;
+      }
+    ];
 in
 pkgs.runCommand "zapret2-presets-eval"
   {
@@ -80,6 +129,14 @@ pkgs.runCommand "zapret2-presets-eval"
       # (в песочнице нет прав на setpcap/nfqueue) — важен ТОЛЬКО разбор опций.
       # ВАЖНО: переменную нельзя звать `out` — затрёт $out деривации.
       parsed="$(nfqws2 @${c.file} 2>&1 || true)"
+      # Спецсимвол в комментарии валит разбор файла ЦЕЛИКОМ, ещё до опций.
+      # Отдельная проверка, потому что иначе видно лишь «профилей не найдено»,
+      # и причина не угадывается.
+      if echo "$parsed" | grep -qi 'failed to split'; then
+        echo "   ОШИБКА: nfqws2 не смог разобрать файл — спецсимвол в комментарии?" >&2
+        echo "$parsed" | grep -i 'failed to split' >&2
+        fail=1
+      fi
       if echo "$parsed" | grep -qi 'unrecognized option\|invalid option\|bad argument'; then
         echo "   ОШИБКА: nfqws2 не принял опции:" >&2
         echo "$parsed" | grep -i 'unrecognized option\|invalid option\|bad argument' >&2

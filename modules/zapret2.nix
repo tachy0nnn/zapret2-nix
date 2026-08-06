@@ -55,6 +55,19 @@ let
   stateDir = "/var/lib/zapret2";
   activeLink = "${stateDir}/active.conf";
 
+  # Стратегии выбранных пресетов в формате списков blockcheck2 — по одному
+  # файлу на вид теста. Нужны режиму `zapret2-blockcheck --presets`.
+  candidateKinds = [
+    "http"
+    "tls"
+    "quic"
+  ];
+  candidateFile = lib.genAttrs candidateKinds (kind: zLib.mkCandidateFile kind selected);
+  candidateHas = kind: zLib.candidateLines kind selected != [ ];
+  # Лежат в /etc, а не только в store: по ним видно, что именно будет
+  # проверяться, и это тот же самый файл, который читает blockcheck2.
+  candidateDir = "/etc/zapret2/blockcheck";
+
   # ---------------------------------------------------------------------------
   # CLI управления. Полноценный TUI с автоподбором — следующая версия, но без
   # какого-либо переключателя «гибридная» модель существует только на бумаге,
@@ -112,6 +125,157 @@ let
           exit 1
           ;;
       esac
+    '';
+  };
+
+  # ---------------------------------------------------------------------------
+  # Обвязка над апстримным blockcheck2 — подбором стратегии.
+  #
+  # Существует по трём причинам, каждая из которых иначе стоит либо часов, либо
+  # ложного результата:
+  #
+  #  1. ВРЕМЯ. `standard`-скан апстрима перебирает на каждый протокол каждого
+  #     домена ~200 стратегий, из которых ~170 — развёртка по TTL
+  #     (MIN_TTL..MAX_TTL и autottl-дельты), и каждая стратегия это поднять
+  #     nfqws2, поставить правила, дождаться таймаута curl. Отсюда «дико
+  #     долго»: часы. Быстрый режим убирает развёртку по TTL и лишние
+  #     протоколы — остаются десятки проверок, то есть минуты. TTL-семейство
+  #     не потеряно: `--full` его вернёт.
+  #
+  #  2. ЧЕСТНОСТЬ РЕЗУЛЬТАТА. blockcheck2 поднимает СВОЙ nfqws2 на своей
+  #     очереди и свои правила. Если наш zapret2 в это время работает, трафик
+  #     обрабатывается дважды и результат ничего не значит. Апстрим лишь пишет
+  #     об этом строчкой в вывод — здесь служба останавливается и возвращается
+  #     обратно по выходу.
+  #
+  #  3. VPN. Через туннель заблокированное открывается само, и blockcheck2
+  #     объявит рабочей ЛЮБУЮ стратегию, включая пустую. Это самый дорогой вид
+  #     ошибки: он выглядит как успех. Проверяется до запуска.
+  # ---------------------------------------------------------------------------
+  zapret2-blockcheck = pkgs.writeShellApplication {
+    name = "zapret2-blockcheck";
+    runtimeInputs = with pkgs; [
+      systemd
+      iproute2
+      coreutils
+      gnugrep
+      gawk
+      cfg.package
+    ];
+    text = ''
+      usage() {
+        cat <<'EOF'
+      zapret2-blockcheck [--presets|--fast|--full] [домен ...]
+
+        --fast     (по умолчанию) стандартный перебор без развёртки по TTL,
+                   только IPv4, TLS 1.2 и QUIC. Минуты вместо часов.
+        --presets  проверить ТОЛЬКО стратегии из своих пресетов. Секунды.
+                   Отвечает на вопрос «работает ли то, что я объявил».
+        --full     апстримный blockcheck2 как есть, интерактивно и целиком.
+                   Когда быстрый скан ничего не нашёл.
+
+      Домены через пробел; по умолчанию берётся домен из апстрима.
+      Любую переменную blockcheck2 можно переопределить из окружения:
+        DOMAINS, IPVS, SCANLEVEL, REPEATS, CURL_MAX_TIME, MAX_TTL,
+        ENABLE_HTTP, ENABLE_HTTPS_TLS12, ENABLE_HTTPS_TLS13, ENABLE_HTTP3.
+
+      Служба zapret2 останавливается на время проверки и поднимается обратно.
+      EOF
+      }
+
+      mode=fast
+      case "''${1-}" in
+        --presets) mode=presets; shift ;;
+        --fast) mode=fast; shift ;;
+        --full) mode=full; shift ;;
+        -h | --help) usage; exit 0 ;;
+        --*) echo "неизвестный ключ: $1" >&2; usage >&2; exit 1 ;;
+      esac
+
+      if [ "$(id -u)" != 0 ]; then
+        echo "нужен root: sudo zapret2-blockcheck ''${mode:+--$mode}" >&2
+        exit 1
+      fi
+
+      # --- туннель -----------------------------------------------------------
+      # Полный туннель обычно ставит либо default через tun-подобный интерфейс,
+      # либо пару 0.0.0.0/1 + 128.0.0.0/1 в обход default (так делает Amnezia).
+      tunnel=""
+      for r in "0.0.0.0/1" "default"; do
+        for dev in $(ip -4 -o route show "$r" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'); do
+          case "$dev" in
+            tun* | tap* | wg* | amn* | proton* | nordlynx | tailscale* | ppp*) tunnel="$dev" ;;
+          esac
+        done
+      done
+      if [ -n "$tunnel" ] && [ "''${ALLOW_VPN-}" != 1 ]; then
+        cat >&2 <<EOF
+      Поднят туннель ($tunnel) — проверка бессмысленна.
+      Через VPN заблокированное открывается само, и blockcheck2 объявит рабочей
+      любую стратегию, включая пустую. Результат будет выглядеть как успех.
+
+      Выключи VPN и запусти снова. Если это не туннель, а ложное срабатывание:
+      ALLOW_VPN=1 sudo zapret2-blockcheck ...
+      EOF
+        exit 1
+      fi
+
+      # --- своя служба -------------------------------------------------------
+      restore=0
+      if systemctl is-active --quiet zapret2.service; then
+        echo "* останавливаю zapret2.service на время проверки"
+        systemctl stop zapret2.service
+        restore=1
+      fi
+      cleanup() {
+        if [ "$restore" = 1 ]; then
+          echo "* поднимаю zapret2.service обратно"
+          systemctl start zapret2.service || true
+        fi
+      }
+      trap cleanup EXIT INT TERM
+
+      if [ "$#" -gt 0 ]; then
+        DOMAINS="$*"
+        export DOMAINS
+      fi
+
+      if [ "$mode" = full ]; then
+        echo "* полный апстримный blockcheck2 (это надолго)"
+        exec blockcheck2
+      fi
+
+      export BATCH=1
+      export IPVS="''${IPVS:-4}"
+      export REPEATS="''${REPEATS:-1}"
+      export CURL_MAX_TIME="''${CURL_MAX_TIME:-2}"
+
+      if [ "$mode" = presets ]; then
+        export TEST=custom
+        export LIST_HTTP="${candidateDir}/http.txt"
+        export LIST_HTTPS_TLS12="${candidateDir}/tls.txt"
+        export LIST_HTTPS_TLS13="${candidateDir}/tls.txt"
+        export LIST_QUIC="${candidateDir}/quic.txt"
+        export ENABLE_HTTP="''${ENABLE_HTTP:-${if candidateHas "http" then "1" else "0"}}"
+        export ENABLE_HTTPS_TLS12="''${ENABLE_HTTPS_TLS12:-${if candidateHas "tls" then "1" else "0"}}"
+        export ENABLE_HTTPS_TLS13="''${ENABLE_HTTPS_TLS13:-0}"
+        export ENABLE_HTTP3="''${ENABLE_HTTP3:-${if candidateHas "quic" then "1" else "0"}}"
+        echo "* проверяю стратегии своих пресетов: ${lib.concatMapStringsSep ", " (p: p.name) selected}"
+      else
+        export TEST="''${TEST:-standard}"
+        export SCANLEVEL="''${SCANLEVEL:-quick}"
+        # Развёртка по TTL — это ~85% всех проверок стандартного скана.
+        # Отключаем в быстром режиме; вернуть — MAX_TTL=12 или --full.
+        export MAX_TTL="''${MAX_TTL:-0}"
+        export MAX_AUTOTTL_DELTA="''${MAX_AUTOTTL_DELTA:-0}"
+        export ENABLE_HTTP="''${ENABLE_HTTP:-0}"
+        export ENABLE_HTTPS_TLS12="''${ENABLE_HTTPS_TLS12:-1}"
+        export ENABLE_HTTPS_TLS13="''${ENABLE_HTTPS_TLS13:-0}"
+        export ENABLE_HTTP3="''${ENABLE_HTTP3:-1}"
+        echo "* быстрый скан: без развёртки по TTL, IPv4, TLS 1.2 + QUIC"
+      fi
+
+      exec blockcheck2
     '';
   };
 in
@@ -237,6 +401,34 @@ in
         '';
       };
 
+      interfaces = mkOption {
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        example = [ "eth0" ];
+        description = ''
+          Исходящие интерфейсы, трафик которых заворачивается в NFQUEUE.
+          `null` — все, без разбора.
+
+          ⚠️ Это стоит задать, если на машине есть VPN или Docker. Правило
+          вешается на postrouting без привязки к интерфейсу, поэтому «все»
+          означает буквально все:
+
+          - **VPN.** Полный туннель (`tun0`, `wg0`, `amn0`…) забирает маршрут
+            по умолчанию, и пакеты в туннель проходят postrouting раньше
+            инкапсуляции. nfqws2 начинает десинхронизировать трафик ВНУТРИ
+            туннеля: DPI провайдера его всё равно не видит, зато сервер на том
+            конце получает подделанные пакеты и рвущиеся сессии. Заодно любая
+            проверка «работает ли обход» становится ложной.
+          - **Docker/LXC.** Трафик контейнеров на 443 идёт через бридж и тоже
+            попадает в очередь — контейнеры получают чужую стратегию обхода.
+
+          Апстримный zapret первой версии сужает свои правила до
+          автоопределённых WAN-интерфейсов (`oifname @wanif`); здесь это
+          решается явным списком, потому что декларативно он известен точно,
+          а автоопределение молча ошибается при переключении сети.
+        '';
+      };
+
       ports = {
         tcp = mkOption {
           type = types.nullOr (types.listOf types.str);
@@ -323,6 +515,24 @@ in
         assertion = lib.all (p: p.profiles != [ ]) selected;
         message = "services.zapret2: пресет без профилей ничего не делает — проверь presets/extraPresets.";
       }
+      {
+        # Имя идёт и в путь файла (/etc/zapret2/available/<имя>.conf), и в
+        # значение `--comment=` внутри конфига. nfqws2 разбирает конфиг по
+        # правилам шелла, поэтому кавычка или скобка в имени положат службу
+        # целиком с невнятным «failed to split command line options».
+        assertion = lib.all (p: builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" p.name != null) selected;
+        message = ''
+          services.zapret2: недопустимое имя пресета.
+          Разрешены только [A-Za-z0-9._-], первый символ — буква или цифра.
+          Проблемные: ${
+            lib.concatStringsSep ", " (
+              map (p: p.name) (
+                lib.filter (p: builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" p.name == null) selected
+              )
+            )
+          }
+        '';
+      }
     ];
 
     # Каталог доступных пресетов — декларативная часть SSOT.
@@ -330,17 +540,35 @@ in
       map (p: {
         "zapret2/available/${p.name}.conf".source = confOf p;
       }) selected
+      # Стратегии тех же пресетов в формате blockcheck2 — SSOT тот же, просто
+      # другой вид. Поэтому «проверить свои стратегии» не требует ничего
+      # переписывать руками и не может разойтись с тем, что реально работает.
+      ++ map (kind: {
+        "zapret2/blockcheck/${kind}.txt".source = candidateFile.${kind};
+      }) candidateKinds
     );
 
     environment.systemPackages = [
       zapret2ctl
-      cfg.package # blockcheck2 под рукой для ручного подбора
+      zapret2-blockcheck
+      cfg.package # сам blockcheck2 тоже под рукой — для ручного подбора
     ];
 
     systemd.services.zapret2 = {
       description = "DPI bypass (zapret2 / nfqws2)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
+
+      # Без этого правка стратегии НЕ ПРИМЕНЯЕТСЯ при пересборке, и это самый
+      # неприятный из возможных багов: всё «прошло успешно», а nfqws2 остался
+      # на прежней цепочке. ExecStart смотрит на /var/lib/zapret2/active.conf —
+      # путь постоянный, юнит от правки пресета не меняется, systemd не видит
+      # причины перезапускать. Хеш конфигов в триггере эту причину даёт.
+      #
+      # Триггерят ВСЕ доступные пресеты, а не только активный: какой активен —
+      # состояние времени выполнения, на этапе сборки оно неизвестно.
+      # Перезапуск лишний раз дешевле молчаливо старой стратегии.
+      restartTriggers = map (p: confOf p) selected;
 
       serviceConfig = {
         # Пакет собран с libsystemd, nfqws2 умеет sd_notify — ждём готовности
